@@ -1,5 +1,5 @@
 const express = require("express");
-const { execFile } = require("child_process");
+const { spawn } = require("child_process");
 const { randomUUID } = require("crypto");
 const fs = require("fs");
 const path = require("path");
@@ -33,31 +33,43 @@ app.use(express.json({ limit: "10mb" }));
 app.get("/", (_req, res) => res.send("OK"));
 
 app.post("/reencode", async (req, res) => {
+  const { url, clearMetadata = true, crf = 23 } = req.body || {};
+  if (!url) return res.status(400).json({ error: "url required" });
+
+  const inPath = path.join("/tmp", randomUUID() + "_in.mp4");
   try {
-    const { url, clearMetadata = true, crf = 23 } = req.body || {};
-    if (!url) return res.status(400).json({ error: "url required" });
-
-    const inPath = path.join("/tmp", randomUUID() + "_in.mp4");
-    const outPath = path.join("/tmp", randomUUID() + "_out.mp4");
-
     await downloadToFile(url, inPath);
-
-    const args = ["-y", "-hide_banner", "-loglevel", "error", "-i", inPath];
-    if (clearMetadata) args.push("-map_metadata", "-1");
-    args.push("-crf", String(crf), "-movflags", "+faststart", outPath);
-
-    execFile("ffmpeg", args, (err) => {
-      try { fs.unlinkSync(inPath); } catch {}
-      if (err) return res.status(500).json({ error: "ffmpeg failed", details: String(err) });
-      res.sendFile(outPath, (sendErr) => {
-        try { fs.unlinkSync(outPath); } catch {}
-        if (sendErr) console.error(sendErr);
-      });
-    });
   } catch (e) {
-    return res.status(500).json({ error: String(e && e.message || e) });
+    return res.status(500).json({ error: "download failed", details: String(e && e.message || e) });
   }
+
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Content-Disposition", 'attachment; filename="out.mp4"');
+  res.setHeader("Cache-Control", "no-store");
+  if (res.flushHeaders) res.flushHeaders();
+  res.setTimeout(0);
+
+  const args = ["-hide_banner", "-loglevel", "error", "-i", inPath];
+  if (clearMetadata) args.push("-map_metadata", "-1");
+  args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", String(crf), "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", "-f", "mp4", "pipe:1");
+
+  const ff = spawn("ffmpeg", args);
+  ff.stdout.pipe(res);
+
+  let finished = false;
+  ff.on("close", (code) => {
+    try { fs.unlinkSync(inPath); } catch {}
+    if (!finished && code !== 0) {
+      try { res.end(); } catch {}
+    }
+  });
+  res.on("close", () => {
+    finished = true;
+    try { ff.kill("SIGKILL"); } catch {}
+    try { fs.unlinkSync(inPath); } catch {}
+  });
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("reencode api v2 listening on " + port));
+app.listen(port, () => console.log("reencode api v3 streaming on " + port));
